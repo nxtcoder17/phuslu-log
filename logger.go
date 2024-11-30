@@ -22,6 +22,7 @@ import (
 var DefaultLogger = Logger{
 	Level:      DebugLevel,
 	Caller:     0,
+	ShowTime:   true,
 	TimeField:  "",
 	TimeFormat: "",
 	Writer:     IOWriter{os.Stderr},
@@ -89,6 +90,9 @@ type Logger struct {
 	// Caller determines if adds the file:line of the "caller" key.
 	// If Caller is negative, adds the full /path/to/file:line of the "caller" key.
 	Caller int
+
+	// ShowTime determines whether to add "time" key and value to log entry
+	ShowTime bool
 
 	// TimeField defines the time field name in output.  It uses "time" in if empty.
 	TimeField string
@@ -388,7 +392,7 @@ func (l *Logger) WithLevel(level Level) (e *Entry) {
 
 // Err starts a new message with error level with err as a field if not nil or with info level if err is nil.
 func (l *Logger) Err(err error) (e *Entry) {
-	var level = InfoLevel
+	level := InfoLevel
 	if err != nil {
 		level = ErrorLevel
 	}
@@ -453,13 +457,15 @@ const smallsString = "00010203040506070809" +
 	"80818283848586878889" +
 	"90919293949596979899"
 
-var timeNow = time.Now
-var timeOffset, timeZone = func() (int64, string) {
-	now := timeNow()
-	_, n := now.Zone()
-	s := now.Format("Z07:00")
-	return int64(n), s
-}()
+var (
+	timeNow              = time.Now
+	timeOffset, timeZone = func() (int64, string) {
+		now := timeNow()
+		_, n := now.Zone()
+		s := now.Format("Z07:00")
+		return int64(n), s
+	}()
+)
 
 func (l *Logger) header(level Level) *Entry {
 	e := epool.Get().(*Entry)
@@ -470,215 +476,224 @@ func (l *Logger) header(level Level) *Entry {
 	} else {
 		e.w = IOWriter{os.Stderr}
 	}
-	// time
-	if l.TimeField == "" {
-		e.buf = append(e.buf, "{\"time\":"...)
-	} else {
-		e.buf = append(e.buf, '{', '"')
-		e.buf = append(e.buf, l.TimeField...)
-		e.buf = append(e.buf, '"', ':')
-	}
-	offset := timeOffset
-	if l.TimeLocation != nil {
-		if l.TimeLocation == time.UTC {
-			offset = 0
-		} else if l.TimeLocation == time.Local {
-			offset = timeOffset
+
+	e.buf = append(e.buf, '{')
+
+	if l.ShowTime {
+		// time
+		if l.TimeField == "" {
+			e.buf = append(e.buf, "\"time\":"...)
 		} else {
-			format := l.TimeFormat
-			if format == "" {
-				format = "2006-01-02T15:04:05.999Z07:00"
+			e.buf = append(e.buf, '"')
+			e.buf = append(e.buf, l.TimeField...)
+			e.buf = append(e.buf, '"', ':')
+		}
+		offset := timeOffset
+		if l.TimeLocation != nil {
+			if l.TimeLocation == time.UTC {
+				offset = 0
+			} else if l.TimeLocation == time.Local {
+				offset = timeOffset
+			} else {
+				format := l.TimeFormat
+				if format == "" {
+					format = "2006-01-02T15:04:05.999Z07:00"
+				}
+				e.buf = append(e.buf, '"')
+				e.buf = timeNow().In(l.TimeLocation).AppendFormat(e.buf, format)
+				e.buf = append(e.buf, '"')
+				goto headerlevel
+			}
+		}
+		switch l.TimeFormat {
+		case "":
+			sec, nsec, _ := now()
+			var tmp [32]byte
+			var buf []byte
+			if offset == 0 {
+				// "2006-01-02T15:04:05.999Z"
+				tmp[25] = '"'
+				tmp[24] = 'Z'
+				buf = tmp[:26]
+			} else {
+				// "2006-01-02T15:04:05.999Z07:00"
+				tmp[30] = '"'
+				tmp[29] = timeZone[5]
+				tmp[28] = timeZone[4]
+				tmp[27] = timeZone[3]
+				tmp[26] = timeZone[2]
+				tmp[25] = timeZone[1]
+				tmp[24] = timeZone[0]
+				buf = tmp[:31]
+			}
+			// date time
+			sec += 9223372028715321600 + offset // unixToInternal + internalToAbsolute + timeOffset
+			year, month, day, _ := absDate(uint64(sec), true)
+			hour, minute, second := absClock(uint64(sec))
+			// year
+			a := year / 100 * 2
+			b := year % 100 * 2
+			tmp[0] = '"'
+			tmp[1] = smallsString[a]
+			tmp[2] = smallsString[a+1]
+			tmp[3] = smallsString[b]
+			tmp[4] = smallsString[b+1]
+			// month
+			month *= 2
+			tmp[5] = '-'
+			tmp[6] = smallsString[month]
+			tmp[7] = smallsString[month+1]
+			// day
+			day *= 2
+			tmp[8] = '-'
+			tmp[9] = smallsString[day]
+			tmp[10] = smallsString[day+1]
+			// hour
+			hour *= 2
+			tmp[11] = 'T'
+			tmp[12] = smallsString[hour]
+			tmp[13] = smallsString[hour+1]
+			// minute
+			minute *= 2
+			tmp[14] = ':'
+			tmp[15] = smallsString[minute]
+			tmp[16] = smallsString[minute+1]
+			// second
+			second *= 2
+			tmp[17] = ':'
+			tmp[18] = smallsString[second]
+			tmp[19] = smallsString[second+1]
+			// milli seconds
+			a = int(nsec) / 1000000
+			b = a % 100 * 2
+			tmp[20] = '.'
+			tmp[21] = byte('0' + a/100)
+			tmp[22] = smallsString[b]
+			tmp[23] = smallsString[b+1]
+			// append to e.buf
+			e.buf = append(e.buf, buf...)
+		case TimeFormatUnix:
+			sec, _, _ := now()
+			// 1595759807
+			var tmp [10]byte
+			// seconds
+			b := sec % 100 * 2
+			sec /= 100
+			tmp[9] = smallsString[b+1]
+			tmp[8] = smallsString[b]
+			b = sec % 100 * 2
+			sec /= 100
+			tmp[7] = smallsString[b+1]
+			tmp[6] = smallsString[b]
+			b = sec % 100 * 2
+			sec /= 100
+			tmp[5] = smallsString[b+1]
+			tmp[4] = smallsString[b]
+			b = sec % 100 * 2
+			sec /= 100
+			tmp[3] = smallsString[b+1]
+			tmp[2] = smallsString[b]
+			b = sec % 100 * 2
+			tmp[1] = smallsString[b+1]
+			tmp[0] = smallsString[b]
+			// append to e.buf
+			e.buf = append(e.buf, tmp[:]...)
+		case TimeFormatUnixMs:
+			sec, nsec, _ := now()
+			// 1595759807105
+			var tmp [13]byte
+			// milli seconds
+			a := int64(nsec) / 1000000
+			b := a % 100 * 2
+			tmp[12] = smallsString[b+1]
+			tmp[11] = smallsString[b]
+			tmp[10] = byte('0' + a/100)
+			// seconds
+			b = sec % 100 * 2
+			sec /= 100
+			tmp[9] = smallsString[b+1]
+			tmp[8] = smallsString[b]
+			b = sec % 100 * 2
+			sec /= 100
+			tmp[7] = smallsString[b+1]
+			tmp[6] = smallsString[b]
+			b = sec % 100 * 2
+			sec /= 100
+			tmp[5] = smallsString[b+1]
+			tmp[4] = smallsString[b]
+			b = sec % 100 * 2
+			sec /= 100
+			tmp[3] = smallsString[b+1]
+			tmp[2] = smallsString[b]
+			b = sec % 100 * 2
+			tmp[1] = smallsString[b+1]
+			tmp[0] = smallsString[b]
+			// append to e.buf
+			e.buf = append(e.buf, tmp[:]...)
+		case TimeFormatUnixWithMs:
+			sec, nsec, _ := now()
+			// 1595759807.105
+			var tmp [14]byte
+			// milli seconds
+			a := int64(nsec) / 1000000
+			b := a % 100 * 2
+			tmp[13] = smallsString[b+1]
+			tmp[12] = smallsString[b]
+			tmp[11] = byte('0' + a/100)
+			tmp[10] = '.'
+			// seconds
+			b = sec % 100 * 2
+			sec /= 100
+			tmp[9] = smallsString[b+1]
+			tmp[8] = smallsString[b]
+			b = sec % 100 * 2
+			sec /= 100
+			tmp[7] = smallsString[b+1]
+			tmp[6] = smallsString[b]
+			b = sec % 100 * 2
+			sec /= 100
+			tmp[5] = smallsString[b+1]
+			tmp[4] = smallsString[b]
+			b = sec % 100 * 2
+			sec /= 100
+			tmp[3] = smallsString[b+1]
+			tmp[2] = smallsString[b]
+			b = sec % 100 * 2
+			tmp[1] = smallsString[b+1]
+			tmp[0] = smallsString[b]
+			// append to e.buf
+			e.buf = append(e.buf, tmp[:]...)
+		default:
+			e.buf = append(e.buf, '"')
+			if l.TimeLocation == time.UTC {
+				e.buf = timeNow().UTC().AppendFormat(e.buf, l.TimeFormat)
+			} else {
+				e.buf = timeNow().AppendFormat(e.buf, l.TimeFormat)
 			}
 			e.buf = append(e.buf, '"')
-			e.buf = timeNow().In(l.TimeLocation).AppendFormat(e.buf, format)
-			e.buf = append(e.buf, '"')
-			goto headerlevel
 		}
-	}
-	switch l.TimeFormat {
-	case "":
-		sec, nsec, _ := now()
-		var tmp [32]byte
-		var buf []byte
-		if offset == 0 {
-			// "2006-01-02T15:04:05.999Z"
-			tmp[25] = '"'
-			tmp[24] = 'Z'
-			buf = tmp[:26]
-		} else {
-			// "2006-01-02T15:04:05.999Z07:00"
-			tmp[30] = '"'
-			tmp[29] = timeZone[5]
-			tmp[28] = timeZone[4]
-			tmp[27] = timeZone[3]
-			tmp[26] = timeZone[2]
-			tmp[25] = timeZone[1]
-			tmp[24] = timeZone[0]
-			buf = tmp[:31]
-		}
-		// date time
-		sec += 9223372028715321600 + offset // unixToInternal + internalToAbsolute + timeOffset
-		year, month, day, _ := absDate(uint64(sec), true)
-		hour, minute, second := absClock(uint64(sec))
-		// year
-		a := year / 100 * 2
-		b := year % 100 * 2
-		tmp[0] = '"'
-		tmp[1] = smallsString[a]
-		tmp[2] = smallsString[a+1]
-		tmp[3] = smallsString[b]
-		tmp[4] = smallsString[b+1]
-		// month
-		month *= 2
-		tmp[5] = '-'
-		tmp[6] = smallsString[month]
-		tmp[7] = smallsString[month+1]
-		// day
-		day *= 2
-		tmp[8] = '-'
-		tmp[9] = smallsString[day]
-		tmp[10] = smallsString[day+1]
-		// hour
-		hour *= 2
-		tmp[11] = 'T'
-		tmp[12] = smallsString[hour]
-		tmp[13] = smallsString[hour+1]
-		// minute
-		minute *= 2
-		tmp[14] = ':'
-		tmp[15] = smallsString[minute]
-		tmp[16] = smallsString[minute+1]
-		// second
-		second *= 2
-		tmp[17] = ':'
-		tmp[18] = smallsString[second]
-		tmp[19] = smallsString[second+1]
-		// milli seconds
-		a = int(nsec) / 1000000
-		b = a % 100 * 2
-		tmp[20] = '.'
-		tmp[21] = byte('0' + a/100)
-		tmp[22] = smallsString[b]
-		tmp[23] = smallsString[b+1]
-		// append to e.buf
-		e.buf = append(e.buf, buf...)
-	case TimeFormatUnix:
-		sec, _, _ := now()
-		// 1595759807
-		var tmp [10]byte
-		// seconds
-		b := sec % 100 * 2
-		sec /= 100
-		tmp[9] = smallsString[b+1]
-		tmp[8] = smallsString[b]
-		b = sec % 100 * 2
-		sec /= 100
-		tmp[7] = smallsString[b+1]
-		tmp[6] = smallsString[b]
-		b = sec % 100 * 2
-		sec /= 100
-		tmp[5] = smallsString[b+1]
-		tmp[4] = smallsString[b]
-		b = sec % 100 * 2
-		sec /= 100
-		tmp[3] = smallsString[b+1]
-		tmp[2] = smallsString[b]
-		b = sec % 100 * 2
-		tmp[1] = smallsString[b+1]
-		tmp[0] = smallsString[b]
-		// append to e.buf
-		e.buf = append(e.buf, tmp[:]...)
-	case TimeFormatUnixMs:
-		sec, nsec, _ := now()
-		// 1595759807105
-		var tmp [13]byte
-		// milli seconds
-		a := int64(nsec) / 1000000
-		b := a % 100 * 2
-		tmp[12] = smallsString[b+1]
-		tmp[11] = smallsString[b]
-		tmp[10] = byte('0' + a/100)
-		// seconds
-		b = sec % 100 * 2
-		sec /= 100
-		tmp[9] = smallsString[b+1]
-		tmp[8] = smallsString[b]
-		b = sec % 100 * 2
-		sec /= 100
-		tmp[7] = smallsString[b+1]
-		tmp[6] = smallsString[b]
-		b = sec % 100 * 2
-		sec /= 100
-		tmp[5] = smallsString[b+1]
-		tmp[4] = smallsString[b]
-		b = sec % 100 * 2
-		sec /= 100
-		tmp[3] = smallsString[b+1]
-		tmp[2] = smallsString[b]
-		b = sec % 100 * 2
-		tmp[1] = smallsString[b+1]
-		tmp[0] = smallsString[b]
-		// append to e.buf
-		e.buf = append(e.buf, tmp[:]...)
-	case TimeFormatUnixWithMs:
-		sec, nsec, _ := now()
-		// 1595759807.105
-		var tmp [14]byte
-		// milli seconds
-		a := int64(nsec) / 1000000
-		b := a % 100 * 2
-		tmp[13] = smallsString[b+1]
-		tmp[12] = smallsString[b]
-		tmp[11] = byte('0' + a/100)
-		tmp[10] = '.'
-		// seconds
-		b = sec % 100 * 2
-		sec /= 100
-		tmp[9] = smallsString[b+1]
-		tmp[8] = smallsString[b]
-		b = sec % 100 * 2
-		sec /= 100
-		tmp[7] = smallsString[b+1]
-		tmp[6] = smallsString[b]
-		b = sec % 100 * 2
-		sec /= 100
-		tmp[5] = smallsString[b+1]
-		tmp[4] = smallsString[b]
-		b = sec % 100 * 2
-		sec /= 100
-		tmp[3] = smallsString[b+1]
-		tmp[2] = smallsString[b]
-		b = sec % 100 * 2
-		tmp[1] = smallsString[b+1]
-		tmp[0] = smallsString[b]
-		// append to e.buf
-		e.buf = append(e.buf, tmp[:]...)
-	default:
-		e.buf = append(e.buf, '"')
-		if l.TimeLocation == time.UTC {
-			e.buf = timeNow().UTC().AppendFormat(e.buf, l.TimeFormat)
-		} else {
-			e.buf = timeNow().AppendFormat(e.buf, l.TimeFormat)
-		}
-		e.buf = append(e.buf, '"')
 	}
 headerlevel:
+	if l.ShowTime {
+		e.buf = append(e.buf, ',')
+	}
+
 	// level
 	switch level {
 	case DebugLevel:
-		e.buf = append(e.buf, ",\"level\":\"debug\""...)
+		e.buf = append(e.buf, "\"level\":\"debug\""...)
 	case InfoLevel:
-		e.buf = append(e.buf, ",\"level\":\"info\""...)
+		e.buf = append(e.buf, "\"level\":\"info\""...)
 	case WarnLevel:
-		e.buf = append(e.buf, ",\"level\":\"warn\""...)
+		e.buf = append(e.buf, "\"level\":\"warn\""...)
 	case ErrorLevel:
-		e.buf = append(e.buf, ",\"level\":\"error\""...)
+		e.buf = append(e.buf, "\"level\":\"error\""...)
 	case TraceLevel:
-		e.buf = append(e.buf, ",\"level\":\"trace\""...)
+		e.buf = append(e.buf, "\"level\":\"trace\""...)
 	case FatalLevel:
-		e.buf = append(e.buf, ",\"level\":\"fatal\""...)
+		e.buf = append(e.buf, "\"level\":\"fatal\""...)
 	case PanicLevel:
-		e.buf = append(e.buf, ",\"level\":\"panic\""...)
+		e.buf = append(e.buf, "\"level\":\"panic\""...)
 	}
 	// context
 	if l.Context != nil {
@@ -1594,7 +1609,8 @@ func (e *Entry) Hex(key string, val []byte) *Entry {
 // Encode encodes bytes using enc.AppendEncode to the entry.
 func (e *Entry) Encode(key string, val []byte, enc interface {
 	AppendEncode(dst, src []byte) []byte
-}) *Entry {
+},
+) *Entry {
 	if e == nil {
 		return nil
 	}
